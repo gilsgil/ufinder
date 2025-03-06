@@ -263,7 +263,7 @@ func discovery(domain, folderName string, compare bool, toolsArg string) {
 		"urlscan": fmt.Sprintf(`curl -s "https://urlscan.io/api/v1/search/?q=domain:%s&size=10000" -H "API-Key: %s" | jq -r '.results[].page.url'`,
 			domain, os.Getenv("URLSCAN")),
 		"urlfinder": fmt.Sprintf("urlfinder -d %s -all", domain),
-		"ducker":    fmt.Sprintf("python3 ~/bugbounty/tools/ducker/ducker.py -q 'site:%s' -c 1000", domain),
+		"ducker":    fmt.Sprintf("ducker -q 'site:%s' -c 1000", domain),
 	}
 	toolFiles := map[string]string{
 		"waymore":     filepath.Join(endpointsDir, "waymore.txt"),
