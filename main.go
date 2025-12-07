@@ -41,8 +41,7 @@ func printBanner() {
 
 	myFigure := figure.NewFigure("UFINDER", "slant", true)
 	color.Cyan(myFigure.String())
-	fmt.Println(color.New(color.FgHiBlack).Sprint("   v2.0 • High Performance Discovery Tool"))
-	fmt.Println(color.New(color.FgHiBlack).Sprint("   by Gilson Oliveira"))
+	fmt.Println(color.New(color.FgHiBlack).Sprint("\n   by Gilson Oliveira"))
 	fmt.Println("")
 }
 
@@ -75,13 +74,19 @@ func countLines(filePath string) int {
 	return count
 }
 
-func runShellCommand(command string) error {
+func runShellCommand(command string, verbose bool) error {
+	if verbose {
+		color.New(color.FgHiBlack).Printf("[CMD] %s\n", command)
+	}
 	cmd := exec.Command("sh", "-c", command)
+	if verbose {
+		cmd.Stderr = os.Stderr
+	}
 	return cmd.Run()
 }
 
 // runTool com visual moderno e spinner
-func runTool(command, toolName, outputFile string) {
+func runTool(command, toolName, outputFile string, verbose bool) {
 	start := time.Now()
 	prevCount := countLines(outputFile)
 
@@ -97,20 +102,20 @@ func runTool(command, toolName, outputFile string) {
 		cmdWithTemp := strings.Replace(command, outputFile, tempWaymore, 1)
 		os.Remove(tempWaymore)
 
-		runShellCommand(cmdWithTemp)
+		runShellCommand(cmdWithTemp, verbose)
 
 		if fileExists(tempWaymore) {
-			runShellCommand(fmt.Sprintf("cat %s >> %s", tempWaymore, outputFile))
+			runShellCommand(fmt.Sprintf("cat %s >> %s", tempWaymore, outputFile), verbose)
 			os.Remove(tempWaymore)
 		}
 	} else {
 		fullCommand := fmt.Sprintf("%s >> %s", command, outputFile)
-		runShellCommand(fullCommand)
+		runShellCommand(fullCommand, verbose)
 	}
 
 	// Ordenação individual
 	sortCmd := fmt.Sprintf("sort -u %s -o %s", outputFile, outputFile)
-	runShellCommand(sortCmd)
+	runShellCommand(sortCmd, verbose)
 	// ---------------------------------------------
 
 	s.Stop() // Para o spinner
@@ -168,9 +173,9 @@ func aggregateAndClean(toolFiles map[string]string, urlsFile string, oldGlobalCo
 
 	if len(filesToMerge) > 0 {
 		cmdCat := fmt.Sprintf("cat %s >> %s", strings.Join(filesToMerge, " "), rawCombined)
-		runShellCommand(cmdCat)
+		runShellCommand(cmdCat, false) // Agregação interna não precisa de verbose
 		cmdSort := fmt.Sprintf("sort -u %s -o %s", rawCombined, urlsFile)
-		runShellCommand(cmdSort)
+		runShellCommand(cmdSort, false)
 		os.Remove(rawCombined)
 	}
 
@@ -198,7 +203,7 @@ func aggregateAndClean(toolFiles map[string]string, urlsFile string, oldGlobalCo
 	fmt.Println("")
 }
 
-func discovery(domain, folderName string, toolsArg string) {
+func discovery(domain, folderName string, toolsArg string, verbose bool) {
 	baseDir := folderName
 	endpointsDir := filepath.Join(baseDir, "endpoints")
 	os.MkdirAll(endpointsDir, 0755)
@@ -224,7 +229,7 @@ func discovery(domain, folderName string, toolsArg string) {
 		"urlscan": fmt.Sprintf(`curl -s "https://urlscan.io/api/v1/search/?q=domain:%s&size=10000" -H "API-Key: %s" | jq -r '.results[].page.url'`,
 			domain, os.Getenv("URLSCAN")),
 		"urlfinder": fmt.Sprintf("urlfinder -d %s -all", domain),
-		"ducker":    fmt.Sprintf("ducker -q 'site:%s' -c 1000", domain),
+		"ducker":    fmt.Sprintf("ducker -q 'site:%s'", domain),
 		"waymore":   fmt.Sprintf("waymore -i %s -mode U -oU %s", domain, toolFiles["waymore"]),
 	}
 
@@ -251,7 +256,7 @@ func discovery(domain, folderName string, toolsArg string) {
 		go func(t, c string) {
 			defer wg.Done()
 			sem <- struct{}{}
-			runTool(c, t, toolFiles[t])
+			runTool(c, t, toolFiles[t], verbose)
 			<-sem
 		}(tool, cmdStr)
 	}
@@ -260,10 +265,23 @@ func discovery(domain, folderName string, toolsArg string) {
 	aggregateAndClean(toolFiles, urlsFile, oldGlobalCount)
 }
 
+func init() {
+	// Garante que ~/go/bin esteja no PATH para ferramentas instaladas via go install
+	home, err := os.UserHomeDir()
+	if err == nil {
+		goBin := filepath.Join(home, "go", "bin")
+		path := os.Getenv("PATH")
+		if !strings.Contains(path, goBin) {
+			os.Setenv("PATH", goBin+string(os.PathListSeparator)+path)
+		}
+	}
+}
+
 func main() {
 	domain := flag.String("d", "", "Target domain")
 	folderName := flag.String("f", "", "Output folder")
 	toolsArg := flag.String("t", "", "Tools list")
+	verbose := flag.Bool("v", false, "Verbose mode")
 	flag.Parse()
 
 	if *folderName == "" || *domain == "" {
@@ -276,5 +294,5 @@ func main() {
 	}
 
 	printBanner()
-	discovery(*domain, *folderName, *toolsArg)
+	discovery(*domain, *folderName, *toolsArg, *verbose)
 }
