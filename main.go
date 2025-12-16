@@ -226,7 +226,7 @@ func discovery(domain, folderName string, toolsArg string, verbose bool) {
 		"waybackurls": fmt.Sprintf("waybackurls %s", domain),
 		"gau":         fmt.Sprintf("gau %s --subs", domain),
 		"xurlfind3r":  fmt.Sprintf("xurlfind3r -d %s --include-subdomains -s", domain),
-		"urlscan": fmt.Sprintf(`curl -s "https://urlscan.io/api/v1/search/?q=domain:%s&size=10000" -H "API-Key: %s" | jq -r '.results[].page.url'`,
+		"urlscan": fmt.Sprintf(`curl -s "https://urlscan.io/api/v1/search/?q=page.domain:%s&size=10000" -H "API-Key: %s" | jq -r '.results[].page.url'`,
 			domain, os.Getenv("URLSCAN")),
 		"urlfinder": fmt.Sprintf("urlfinder -d %s -all", domain),
 		"ducker":    fmt.Sprintf("ducker -q 'site:%s'", domain),
