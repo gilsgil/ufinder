@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -161,6 +162,20 @@ func aggregateAndClean(toolFiles map[string]string, urlsFile string, oldGlobalCo
 	rawCombined := urlsFile + ".tmp"
 	os.Remove(rawCombined)
 
+	// Salvar URLs antigas antes de agregar (para calcular diff depois)
+	oldURLs := make(map[string]bool)
+	if fileExists(urlsFile) {
+		oldContent, err := os.ReadFile(urlsFile)
+		if err == nil {
+			for _, line := range strings.Split(string(oldContent), "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					oldURLs[line] = true
+				}
+			}
+		}
+	}
+
 	var filesToMerge []string
 	if fileExists(urlsFile) {
 		filesToMerge = append(filesToMerge, urlsFile)
@@ -181,9 +196,35 @@ func aggregateAndClean(toolFiles map[string]string, urlsFile string, oldGlobalCo
 
 	s.Stop()
 
+	// Calcular URLs novas (diff entre arquivo final e antigas)
+	var newURLs []string
+	if fileExists(urlsFile) {
+		newContent, err := os.ReadFile(urlsFile)
+		if err == nil {
+			for _, line := range strings.Split(string(newContent), "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" && !oldURLs[line] {
+					newURLs = append(newURLs, line)
+				}
+			}
+		}
+	}
+
+	// Ordenar as novas URLs (ascending)
+	sort.Strings(newURLs)
+
+	// Salvar last_results.txt
+	lastResultsFile := filepath.Join(filepath.Dir(urlsFile), "last_results.txt")
+	if len(newURLs) > 0 {
+		os.WriteFile(lastResultsFile, []byte(strings.Join(newURLs, "\n")+"\n"), 0644)
+	} else {
+		// Arquivo vazio se não houver novas URLs
+		os.WriteFile(lastResultsFile, []byte{}, 0644)
+	}
+
 	// Stats Finais
 	newGlobalCount := countLines(urlsFile)
-	realNewURLs := newGlobalCount - oldGlobalCount
+	realNewURLs := len(newURLs)
 
 	// Caixa de Resumo Moderno
 	fmt.Println("")
@@ -200,6 +241,17 @@ func aggregateAndClean(toolFiles map[string]string, urlsFile string, oldGlobalCo
 		fmt.Printf("│  %s           : %-22s │\n", "Unique New URLs", color.HiBlackString("0"))
 	}
 	fmt.Println(color.HiBlackString("└──────────────────────────────────────────────┘"))
+
+	// Mostrar as novas URLs no terminal (ordenadas ascending)
+	if len(newURLs) > 0 {
+		fmt.Println("")
+		fmt.Println(color.HiCyanString("┌──────────────────────────────────────────────┐"))
+		fmt.Printf("│  %s                       │\n", color.HiWhiteString("NEW URLS FOUND"))
+		fmt.Println(color.HiCyanString("└──────────────────────────────────────────────┘"))
+		for _, url := range newURLs {
+			fmt.Printf("  %s %s\n", color.HiGreenString("→"), url)
+		}
+	}
 	fmt.Println("")
 }
 
