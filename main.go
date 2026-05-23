@@ -2,8 +2,11 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +23,25 @@ import (
 
 // CONFIGURAÇÃO
 const MaxConcurrentTools = 1
+const resumeStateFileName = ".ufinder-resume.json"
+
+var defaultToolsOrder = []string{
+	"waymore",
+	"waybackurls",
+	"gau",
+	"gau_subs",
+	"xurlfind3r",
+	"urlscan",
+	"urlfinder",
+	"ducker",
+}
+
+type resumeState struct {
+	ListFile     string   `json:"list_file"`
+	OutputFolder string   `json:"output_folder,omitempty"`
+	Completed    []string `json:"completed"`
+	UpdatedAt    string   `json:"updated_at,omitempty"`
+}
 
 // --- HELPERS VISUAIS ---
 
@@ -46,10 +68,36 @@ func printBanner() {
 	fmt.Println("")
 }
 
-func printHeader(domain, folder string) {
-	fmt.Printf("   %s Target: %s\n", iconFire, color.HiWhiteString(domain))
+func printHeader(domain, folder string, currentTarget int, totalTargets int) {
+	targetLine := domain
+	if totalTargets > 0 {
+		targetLine = fmt.Sprintf("[%d/%d] %s", currentTarget, totalTargets, domain)
+	}
+
+	fmt.Printf("   %s Target: %s\n", iconFire, color.HiWhiteString(targetLine))
 	fmt.Printf("   %s Output: %s\n", iconBox, color.HiWhiteString(folder))
 	fmt.Println(strings.Repeat(color.HiBlackString("─"), 60))
+	fmt.Println("")
+}
+
+func printTargetSeparator() {
+	fmt.Println("")
+	fmt.Println(color.HiBlackString(strings.Repeat("=", 60)))
+	fmt.Println("")
+}
+
+func printSectionBox(title string) {
+	fmt.Println(color.HiCyanString("┌──────────────────────────────────────────────┐"))
+	fmt.Printf("│  %s%s│\n", color.HiWhiteString(title), strings.Repeat(" ", 42-len(title)))
+	fmt.Println(color.HiCyanString("└──────────────────────────────────────────────┘"))
+}
+
+func printElapsedBox(title string, elapsed time.Duration) {
+	fmt.Println(color.HiBlackString("┌──────────────────────────────────────────────┐"))
+	fmt.Printf("│  %s%s│\n", color.HiWhiteString(title), strings.Repeat(" ", 42-len(title)))
+	fmt.Println(color.HiBlackString("├──────────────────────────────────────────────┤"))
+	fmt.Printf("│  Elapsed Time       : %-22s │\n", elapsed.Round(time.Second))
+	fmt.Println(color.HiBlackString("└──────────────────────────────────────────────┘"))
 	fmt.Println("")
 }
 
@@ -63,16 +111,161 @@ func fileExists(filePath string) bool {
 	return !info.IsDir()
 }
 
+func shellEscape(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+func isJSURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+
+	return strings.HasSuffix(strings.ToLower(parsed.Path), ".js")
+}
+
+func normalizeJSURL(rawURL string) (string, bool) {
+	if !isJSURL(rawURL) {
+		return "", false
+	}
+
+	return normalizeUniqueURL(rawURL)
+}
+
+func normalizeUniqueURL(rawURL string) (string, bool) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" {
+		return "", false
+	}
+
+	host := strings.ToLower(parsed.Hostname())
+	port := parsed.Port()
+	if port != "" && port != "80" && port != "443" {
+		host = host + ":" + port
+	}
+
+	path := parsed.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+
+	return host + path, true
+}
+
+func normalizeHost(rawValue string) (string, bool) {
+	rawValue = strings.TrimSpace(rawValue)
+	if rawValue == "" {
+		return "", false
+	}
+
+	if !strings.Contains(rawValue, "://") {
+		rawValue = "https://" + rawValue
+	}
+
+	parsed, err := url.Parse(rawValue)
+	if err != nil || parsed.Host == "" {
+		return "", false
+	}
+
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" {
+		return "", false
+	}
+
+	port := parsed.Port()
+	if port != "" && port != "80" && port != "443" {
+		host = host + ":" + port
+	}
+
+	return host, true
+}
+
+func isSubdomainOf(host string, seed string) bool {
+	return host != seed && strings.HasSuffix(host, "."+seed)
+}
+
 func countLines(filePath string) int {
 	if !fileExists(filePath) {
 		return 0
 	}
-	out, err := exec.Command("sh", "-c", fmt.Sprintf("wc -l < %s", filePath)).Output()
+	out, err := exec.Command("sh", "-c", fmt.Sprintf("wc -l < %s", shellEscape(filePath))).Output()
 	if err != nil {
 		return 0
 	}
 	count, _ := strconv.Atoi(strings.TrimSpace(string(out)))
 	return count
+}
+
+func writeFileAtomic(filePath string, data []byte) error {
+	tempFile := filePath + ".tmp"
+	if err := os.WriteFile(tempFile, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tempFile, filePath)
+}
+
+func resolveResumeStatePath(baseFolder string) string {
+	return filepath.Join(baseFolder, resumeStateFileName)
+}
+
+func loadResumeState(filePath string) (*resumeState, error) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	var state resumeState
+	if err := json.Unmarshal(content, &state); err != nil {
+		return nil, err
+	}
+	if state.Completed == nil {
+		state.Completed = []string{}
+	}
+
+	return &state, nil
+}
+
+func saveResumeState(filePath string, state *resumeState) error {
+	state.UpdatedAt = time.Now().Format(time.RFC3339)
+	content, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	content = append(content, '\n')
+	return writeFileAtomic(filePath, content)
+}
+
+func completedTargetsSet(completed []string) map[string]bool {
+	set := make(map[string]bool, len(completed))
+	for _, target := range completed {
+		target = strings.TrimSpace(target)
+		if target != "" {
+			set[target] = true
+		}
+	}
+	return set
+}
+
+func normalizePathForState(filePath string) string {
+	if filePath == "" {
+		return ""
+	}
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return filePath
+	}
+	return absPath
+}
+
+func printResumeStatus(completedCount, totalTargets int, statePath string) {
+	fmt.Println(color.HiCyanString("┌──────────────────────────────────────────────┐"))
+	fmt.Printf("│  %s                            │\n", color.HiWhiteString("RESUME MODE ENABLED"))
+	fmt.Println(color.HiCyanString("├──────────────────────────────────────────────┤"))
+	fmt.Printf("│  Completed Targets : %-21d │\n", completedCount)
+	fmt.Printf("│  Remaining Targets : %-21d │\n", totalTargets-completedCount)
+	fmt.Printf("│  State File        : %-21s │\n", filepath.Base(statePath))
+	fmt.Println(color.HiCyanString("└──────────────────────────────────────────────┘"))
+	fmt.Println("")
 }
 
 func runShellCommand(command string, verbose bool) error {
@@ -106,16 +299,16 @@ func runTool(command, toolName, outputFile string, verbose bool) {
 		runShellCommand(cmdWithTemp, verbose)
 
 		if fileExists(tempWaymore) {
-			runShellCommand(fmt.Sprintf("cat %s >> %s", tempWaymore, outputFile), verbose)
+			runShellCommand(fmt.Sprintf("cat %s >> %s", shellEscape(tempWaymore), shellEscape(outputFile)), verbose)
 			os.Remove(tempWaymore)
 		}
 	} else {
-		fullCommand := fmt.Sprintf("%s >> %s", command, outputFile)
+		fullCommand := fmt.Sprintf("%s >> %s", command, shellEscape(outputFile))
 		runShellCommand(fullCommand, verbose)
 	}
 
 	// Ordenação individual
-	sortCmd := fmt.Sprintf("sort -u %s -o %s", outputFile, outputFile)
+	sortCmd := fmt.Sprintf("sort -u %s -o %s", shellEscape(outputFile), shellEscape(outputFile))
 	runShellCommand(sortCmd, verbose)
 	// ---------------------------------------------
 
@@ -151,7 +344,7 @@ func runTool(command, toolName, outputFile string, verbose bool) {
 	)
 }
 
-func aggregateAndClean(toolFiles map[string]string, urlsFile string, oldGlobalCount int) {
+func aggregateAndClean(toolFiles map[string]string, urlsFile string, oldGlobalCount int, quiet bool) []string {
 	// Spinner para a agregação
 	fmt.Println("")
 	s := spinner.New(spinner.CharSets[11], 100*time.Millisecond)
@@ -187,9 +380,13 @@ func aggregateAndClean(toolFiles map[string]string, urlsFile string, oldGlobalCo
 	}
 
 	if len(filesToMerge) > 0 {
-		cmdCat := fmt.Sprintf("cat %s >> %s", strings.Join(filesToMerge, " "), rawCombined)
+		quotedFiles := make([]string, 0, len(filesToMerge))
+		for _, file := range filesToMerge {
+			quotedFiles = append(quotedFiles, shellEscape(file))
+		}
+		cmdCat := fmt.Sprintf("cat %s >> %s", strings.Join(quotedFiles, " "), shellEscape(rawCombined))
 		runShellCommand(cmdCat, false) // Agregação interna não precisa de verbose
-		cmdSort := fmt.Sprintf("sort -u %s -o %s", rawCombined, urlsFile)
+		cmdSort := fmt.Sprintf("sort -u %s -o %s", shellEscape(rawCombined), shellEscape(urlsFile))
 		runShellCommand(cmdSort, false)
 		os.Remove(rawCombined)
 	}
@@ -243,7 +440,7 @@ func aggregateAndClean(toolFiles map[string]string, urlsFile string, oldGlobalCo
 	fmt.Println(color.HiBlackString("└──────────────────────────────────────────────┘"))
 
 	// Mostrar as novas URLs no terminal (ordenadas ascending)
-	if len(newURLs) > 0 {
+	if len(newURLs) > 0 && !quiet {
 		fmt.Println("")
 		fmt.Println(color.HiCyanString("┌──────────────────────────────────────────────┐"))
 		fmt.Printf("│  %s                       │\n", color.HiWhiteString("NEW URLS FOUND"))
@@ -253,46 +450,366 @@ func aggregateAndClean(toolFiles map[string]string, urlsFile string, oldGlobalCo
 		}
 	}
 	fmt.Println("")
+
+	return newURLs
 }
 
-func discovery(domain, folderName string, toolsArg string, verbose bool) {
+func readLinesAsSet(filePath string) map[string]bool {
+	set := make(map[string]bool)
+	if !fileExists(filePath) {
+		return set
+	}
+
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return set
+	}
+
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			set[line] = true
+		}
+	}
+
+	return set
+}
+
+func writeSortedSet(filePath string, set map[string]bool) {
+	values := make([]string, 0, len(set))
+	for value := range set {
+		values = append(values, value)
+	}
+	sort.Strings(values)
+
+	if len(values) > 0 {
+		os.WriteFile(filePath, []byte(strings.Join(values, "\n")+"\n"), 0644)
+	} else {
+		os.WriteFile(filePath, []byte{}, 0644)
+	}
+}
+
+func extractJSURLs(urlsFile string, inputURLs []string) (int, int) {
+	jsFile := filepath.Join(filepath.Dir(urlsFile), "js.txt")
+	jsUniqueFile := filepath.Join(filepath.Dir(urlsFile), "js_unique.txt")
+	jsSet := readLinesAsSet(jsFile)
+	jsUniqueSet := readLinesAsSet(jsUniqueFile)
+	prevCount := len(jsUniqueSet)
+
+	for _, line := range inputURLs {
+		line = strings.TrimSpace(line)
+		if line == "" || !isJSURL(line) {
+			continue
+		}
+		jsSet[line] = true
+		if normalized, ok := normalizeJSURL(line); ok {
+			jsUniqueSet[normalized] = true
+		}
+	}
+
+	writeSortedSet(jsFile, jsSet)
+	writeSortedSet(jsUniqueFile, jsUniqueSet)
+
+	currentCount := len(jsUniqueSet)
+	newCount := currentCount - prevCount
+	if newCount < 0 {
+		newCount = 0
+	}
+
+	return currentCount, newCount
+}
+
+func extractJSFromFile(urlsFile string, quiet bool) error {
+	if !fileExists(urlsFile) {
+		return fmt.Errorf("urls file not found: %s", urlsFile)
+	}
+
+	inputURLs := make([]string, 0)
+	for line := range readLinesAsSet(urlsFile) {
+		inputURLs = append(inputURLs, line)
+	}
+	sort.Strings(inputURLs)
+
+	printSectionBox("JAVASCRIPT EXTRACTION")
+	jsCount, newJSCount := extractJSURLs(urlsFile, inputURLs)
+	jsLabel := fmt.Sprintf("%-12s", "JS UNIQUE")
+	totalLabel := fmt.Sprintf("%8d urls", jsCount)
+
+	var newLabel string
+	if newJSCount > 0 {
+		newLabel = colorNew(fmt.Sprintf("+%d new", newJSCount))
+	} else {
+		newLabel = colorZero("0 new")
+	}
+
+	fmt.Printf(" %s %s  %s  %s\n",
+		iconCheck,
+		colorTool(jsLabel),
+		totalLabel,
+		newLabel,
+	)
+	fmt.Println("")
+
+	if !quiet {
+		jsFile := filepath.Join(filepath.Dir(urlsFile), "js.txt")
+		jsUniqueFile := filepath.Join(filepath.Dir(urlsFile), "js_unique.txt")
+		fmt.Printf("   %s Source: %s\n", iconSearch, color.HiWhiteString(urlsFile))
+		fmt.Printf("   %s Output: %s\n", iconBox, color.HiWhiteString(filepath.Dir(urlsFile)))
+		fmt.Printf("   %s Files : %s, %s\n", iconCheck, color.HiWhiteString(filepath.Base(jsFile)), color.HiWhiteString(filepath.Base(jsUniqueFile)))
+		fmt.Println("")
+	}
+
+	return nil
+}
+
+func extractUniqueFromFile(urlsFile string, quiet bool) error {
+	if !fileExists(urlsFile) {
+		return fmt.Errorf("urls file not found: %s", urlsFile)
+	}
+
+	inputURLs := make([]string, 0)
+	for line := range readLinesAsSet(urlsFile) {
+		inputURLs = append(inputURLs, line)
+	}
+	sort.Strings(inputURLs)
+
+	printSectionBox("URL NORMALIZATION")
+	uniqueCount, newUniqueCount := extractUniqueURLs(urlsFile, inputURLs)
+	uniqueLabel := fmt.Sprintf("%-12s", "URLS UNIQUE")
+	totalLabel := fmt.Sprintf("%8d urls", uniqueCount)
+
+	var newLabel string
+	if newUniqueCount > 0 {
+		newLabel = colorNew(fmt.Sprintf("+%d new", newUniqueCount))
+	} else {
+		newLabel = colorZero("0 new")
+	}
+
+	fmt.Printf(" %s %s  %s  %s\n",
+		iconCheck,
+		colorTool(uniqueLabel),
+		totalLabel,
+		newLabel,
+	)
+	fmt.Println("")
+
+	if !quiet {
+		uniqueFile := filepath.Join(filepath.Dir(urlsFile), "urls_unique.txt")
+		fmt.Printf("   %s Source: %s\n", iconSearch, color.HiWhiteString(urlsFile))
+		fmt.Printf("   %s Output: %s\n", iconBox, color.HiWhiteString(filepath.Dir(urlsFile)))
+		fmt.Printf("   %s Files : %s\n", iconCheck, color.HiWhiteString(filepath.Base(uniqueFile)))
+		fmt.Println("")
+	}
+
+	return nil
+}
+
+func extractSubdomainsFromFile(urlsFile string, knownTargets []string, quiet bool) error {
+	if !fileExists(urlsFile) {
+		return fmt.Errorf("urls file not found: %s", urlsFile)
+	}
+
+	inputURLs := make([]string, 0)
+	for line := range readLinesAsSet(urlsFile) {
+		inputURLs = append(inputURLs, line)
+	}
+	sort.Strings(inputURLs)
+
+	printSectionBox("SUBDOMAIN EXTRACTION")
+	subdomainsCount, newSubdomainsCount := extractSubdomains(urlsFile, inputURLs, knownTargets)
+	subdomainsLabel := fmt.Sprintf("%-12s", "SUBDOMAINS")
+	totalLabel := fmt.Sprintf("%8d subs", subdomainsCount)
+
+	var newLabel string
+	if newSubdomainsCount > 0 {
+		newLabel = colorNew(fmt.Sprintf("+%d new", newSubdomainsCount))
+	} else {
+		newLabel = colorZero("0 new")
+	}
+
+	fmt.Printf(" %s %s  %s  %s\n",
+		iconCheck,
+		colorTool(subdomainsLabel),
+		totalLabel,
+		newLabel,
+	)
+	fmt.Println("")
+
+	if !quiet {
+		subdomainsFile := filepath.Join(filepath.Dir(urlsFile), "subdomains.txt")
+		subdomainsNewFile := filepath.Join(filepath.Dir(urlsFile), "subdomains_new.txt")
+		fmt.Printf("   %s Source: %s\n", iconSearch, color.HiWhiteString(urlsFile))
+		fmt.Printf("   %s Output: %s\n", iconBox, color.HiWhiteString(filepath.Dir(urlsFile)))
+		fmt.Printf("   %s Files : %s, %s\n", iconCheck, color.HiWhiteString(filepath.Base(subdomainsFile)), color.HiWhiteString(filepath.Base(subdomainsNewFile)))
+		fmt.Println("")
+	}
+
+	return nil
+}
+
+func extractUniqueURLs(urlsFile string, inputURLs []string) (int, int) {
+	uniqueFile := filepath.Join(filepath.Dir(urlsFile), "urls_unique.txt")
+	uniqueSet := readLinesAsSet(uniqueFile)
+	prevCount := len(uniqueSet)
+
+	for _, line := range inputURLs {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if normalized, ok := normalizeUniqueURL(line); ok {
+			uniqueSet[normalized] = true
+		}
+	}
+
+	writeSortedSet(uniqueFile, uniqueSet)
+
+	currentCount := len(uniqueSet)
+	newCount := currentCount - prevCount
+	if newCount < 0 {
+		newCount = 0
+	}
+
+	return currentCount, newCount
+}
+
+func extractSubdomains(urlsFile string, inputURLs []string, knownTargets []string) (int, int) {
+	subdomainsFile := filepath.Join(filepath.Dir(urlsFile), "subdomains.txt")
+	subdomainsNewFile := filepath.Join(filepath.Dir(urlsFile), "subdomains_new.txt")
+	knownTargetsSet := make(map[string]bool)
+	for _, target := range knownTargets {
+		if normalized, ok := normalizeHost(target); ok {
+			knownTargetsSet[normalized] = true
+		}
+	}
+
+	subdomainsSet := readLinesAsSet(subdomainsFile)
+	subdomainsNewSet := readLinesAsSet(subdomainsNewFile)
+	prevCount := len(subdomainsNewSet)
+
+	for _, line := range inputURLs {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if host, ok := normalizeHost(line); ok {
+			for seed := range knownTargetsSet {
+				if isSubdomainOf(host, seed) {
+					subdomainsSet[host] = true
+					if !knownTargetsSet[host] {
+						subdomainsNewSet[host] = true
+					}
+					break
+				}
+			}
+		}
+	}
+
+	writeSortedSet(subdomainsFile, subdomainsSet)
+	writeSortedSet(subdomainsNewFile, subdomainsNewSet)
+
+	currentCount := len(subdomainsNewSet)
+	newCount := currentCount - prevCount
+	if newCount < 0 {
+		newCount = 0
+	}
+
+	return len(subdomainsSet), newCount
+}
+
+func sanitizeTargetName(target string) string {
+	replacer := strings.NewReplacer(
+		"/", "_",
+		"\\", "_",
+		":", "_",
+		" ", "_",
+		"\t", "_",
+	)
+	sanitized := strings.TrimSpace(replacer.Replace(target))
+	sanitized = strings.Trim(sanitized, "._-")
+	if sanitized == "" {
+		return "target"
+	}
+	return sanitized
+}
+
+func loadTargetsFromFile(filePath string) ([]string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var targets []string
+	seen := make(map[string]bool)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !seen[line] {
+			targets = append(targets, line)
+			seen[line] = true
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return targets, nil
+}
+
+func buildToolFiles(endpointsDir string) map[string]string {
+	return map[string]string{
+		"waymore":     filepath.Join(endpointsDir, "waymore.txt"),
+		"waybackurls": filepath.Join(endpointsDir, "waybackurls.txt"),
+		"gau":         filepath.Join(endpointsDir, "gau.txt"),
+		"gau_subs":    filepath.Join(endpointsDir, "gau_subs.txt"),
+		"xurlfind3r":  filepath.Join(endpointsDir, "xurlfind3r.txt"),
+		"urlscan":     filepath.Join(endpointsDir, "urlscan.txt"),
+		"urlfinder":   filepath.Join(endpointsDir, "urlfinder.txt"),
+		"ducker":      filepath.Join(endpointsDir, "ducker.txt"),
+	}
+}
+
+func buildToolCommands(domain string, toolFiles map[string]string) map[string]string {
+	return map[string]string{
+		"waybackurls": fmt.Sprintf("waybackurls %s", shellEscape(domain)),
+		"gau":         fmt.Sprintf("gau %s", shellEscape(domain)),
+		"gau_subs":    fmt.Sprintf("gau %s --subs", shellEscape(domain)),
+		"xurlfind3r":  fmt.Sprintf("xurlfind3r -d %s --include-subdomains -s", shellEscape(domain)),
+		"urlscan": fmt.Sprintf(`curl -s "https://urlscan.io/api/v1/search/?q=page.domain:%s&size=10000" -H "API-Key: %s" | jq -r '.results[].page.url'`,
+			domain, os.Getenv("URLSCAN")),
+		"urlfinder": fmt.Sprintf("urlfinder -d %s -all", shellEscape(domain)),
+		"ducker":    fmt.Sprintf("ducker -q %s", shellEscape("site:"+domain)),
+		"waymore":   fmt.Sprintf("waymore -i %s -mode U -oU %s", shellEscape(domain), shellEscape(toolFiles["waymore"])),
+	}
+}
+
+func selectTools(toolsArg string) []string {
+	if toolsArg == "" {
+		selected := make([]string, len(defaultToolsOrder))
+		copy(selected, defaultToolsOrder)
+		return selected
+	}
+
+	return strings.Split(toolsArg, ",")
+}
+
+func discovery(domain, folderName string, toolsArg string, verbose bool, quiet bool, extractJS bool, extractUnique bool, extractSubdomainsEnabled bool, knownTargets []string, currentTarget int, totalTargets int) {
 	baseDir := folderName
 	endpointsDir := filepath.Join(baseDir, "endpoints")
 	os.MkdirAll(endpointsDir, 0755)
 	urlsFile := filepath.Join(endpointsDir, "urls.txt")
 	oldGlobalCount := countLines(urlsFile)
 
-	printHeader(domain, folderName)
+	printHeader(domain, folderName, currentTarget, totalTargets)
 
-	toolFiles := map[string]string{
-		"waymore":     filepath.Join(endpointsDir, "waymore.txt"),
-		"waybackurls": filepath.Join(endpointsDir, "waybackurls.txt"),
-		"gau":         filepath.Join(endpointsDir, "gau.txt"),
-		"xurlfind3r":  filepath.Join(endpointsDir, "xurlfind3r.txt"),
-		"urlscan":     filepath.Join(endpointsDir, "urlscan.txt"),
-		"urlfinder":   filepath.Join(endpointsDir, "urlfinder.txt"),
-		"ducker":      filepath.Join(endpointsDir, "ducker.txt"),
-	}
-
-	toolCommands := map[string]string{
-		"waybackurls": fmt.Sprintf("waybackurls %s", domain),
-		"gau":         fmt.Sprintf("gau %s --subs", domain),
-		"xurlfind3r":  fmt.Sprintf("xurlfind3r -d %s --include-subdomains -s", domain),
-		"urlscan": fmt.Sprintf(`curl -s "https://urlscan.io/api/v1/search/?q=page.domain:%s&size=10000" -H "API-Key: %s" | jq -r '.results[].page.url'`,
-			domain, os.Getenv("URLSCAN")),
-		"urlfinder": fmt.Sprintf("urlfinder -d %s -all", domain),
-		"ducker":    fmt.Sprintf("ducker -q 'site:%s'", domain),
-		"waymore":   fmt.Sprintf("waymore -i %s -mode U -oU %s", domain, toolFiles["waymore"]),
-	}
-
-	var selectedTools []string
-	if toolsArg != "" {
-		selectedTools = strings.Split(toolsArg, ",")
-	} else {
-		for tool := range toolFiles {
-			selectedTools = append(selectedTools, tool)
-		}
-	}
+	toolFiles := buildToolFiles(endpointsDir)
+	toolCommands := buildToolCommands(domain, toolFiles)
+	selectedTools := selectTools(toolsArg)
 
 	sem := make(chan struct{}, MaxConcurrentTools)
 	var wg sync.WaitGroup
@@ -314,7 +831,183 @@ func discovery(domain, folderName string, toolsArg string, verbose bool) {
 	}
 	wg.Wait()
 
-	aggregateAndClean(toolFiles, urlsFile, oldGlobalCount)
+	newURLs := aggregateAndClean(toolFiles, urlsFile, oldGlobalCount, quiet)
+	if extractUnique {
+		printSectionBox("URL NORMALIZATION")
+		uniqueCount, newUniqueCount := extractUniqueURLs(urlsFile, newURLs)
+		uniqueLabel := fmt.Sprintf("%-12s", "URLS UNIQUE")
+		totalLabel := fmt.Sprintf("%8d urls", uniqueCount)
+
+		var newLabel string
+		if newUniqueCount > 0 {
+			newLabel = colorNew(fmt.Sprintf("+%d new", newUniqueCount))
+		} else {
+			newLabel = colorZero("0 new")
+		}
+
+		fmt.Printf(" %s %s  %s  %s\n",
+			iconCheck,
+			colorTool(uniqueLabel),
+			totalLabel,
+			newLabel,
+		)
+		fmt.Println("")
+	}
+	if extractSubdomainsEnabled {
+		printSectionBox("SUBDOMAIN EXTRACTION")
+		subdomainsCount, newSubdomainsCount := extractSubdomains(urlsFile, newURLs, knownTargets)
+		subdomainsLabel := fmt.Sprintf("%-12s", "SUBDOMAINS")
+		totalLabel := fmt.Sprintf("%8d subs", subdomainsCount)
+
+		var newLabel string
+		if newSubdomainsCount > 0 {
+			newLabel = colorNew(fmt.Sprintf("+%d new", newSubdomainsCount))
+		} else {
+			newLabel = colorZero("0 new")
+		}
+
+		fmt.Printf(" %s %s  %s  %s\n",
+			iconCheck,
+			colorTool(subdomainsLabel),
+			totalLabel,
+			newLabel,
+		)
+		fmt.Println("")
+	}
+	if extractJS {
+		printSectionBox("JAVASCRIPT EXTRACTION")
+		jsCount, newJSCount := extractJSURLs(urlsFile, newURLs)
+		jsLabel := fmt.Sprintf("%-12s", "JS UNIQUE")
+		totalLabel := fmt.Sprintf("%8d urls", jsCount)
+
+		var newLabel string
+		if newJSCount > 0 {
+			newLabel = colorNew(fmt.Sprintf("+%d new", newJSCount))
+		} else {
+			newLabel = colorZero("0 new")
+		}
+
+		fmt.Printf(" %s %s  %s  %s\n",
+			iconCheck,
+			colorTool(jsLabel),
+			totalLabel,
+			newLabel,
+		)
+		fmt.Println("")
+	}
+}
+
+func runDiscovery(targets []string, baseFolder, toolsArg string, verbose bool, quiet bool, extractJS bool, extractUnique bool, extractSubdomainsEnabled bool, splitPerTarget bool, resumeEnabled bool, restartEnabled bool, listFilePath string) error {
+	usedFolders := make(map[string]int)
+	totalStart := time.Now()
+	resumeStatePath := resolveResumeStatePath(baseFolder)
+	var state *resumeState
+	completedSet := make(map[string]bool)
+
+	if err := os.MkdirAll(baseFolder, 0755); err != nil {
+		return fmt.Errorf("error creating output folder: %w", err)
+	}
+
+	if restartEnabled {
+		state = &resumeState{
+			ListFile:     listFilePath,
+			OutputFolder: normalizePathForState(baseFolder),
+			Completed:    []string{},
+		}
+		if err := saveResumeState(resumeStatePath, state); err != nil {
+			return fmt.Errorf("error resetting resume state: %w", err)
+		}
+		if !quiet {
+			color.Yellow("  Restart mode enabled, resetting resume state at %s.", resumeStatePath)
+			fmt.Println("")
+		}
+	}
+
+	if resumeEnabled {
+		if fileExists(resumeStatePath) {
+			loadedState, err := loadResumeState(resumeStatePath)
+			if err != nil {
+				return fmt.Errorf("error reading resume state: %w", err)
+			}
+			if loadedState.ListFile != "" && listFilePath != "" && loadedState.ListFile != listFilePath {
+				return fmt.Errorf("resume state belongs to a different target list: %s", loadedState.ListFile)
+			}
+			state = loadedState
+			completedSet = completedTargetsSet(state.Completed)
+		} else {
+			if !quiet {
+				color.Yellow("  Resume file not found at %s, starting fresh.", resumeStatePath)
+				fmt.Println("")
+			}
+			state = &resumeState{}
+		}
+
+		if state.ListFile == "" {
+			state.ListFile = listFilePath
+		}
+		if state.OutputFolder == "" {
+			state.OutputFolder = normalizePathForState(baseFolder)
+		}
+		if err := saveResumeState(resumeStatePath, state); err != nil {
+			return fmt.Errorf("error initializing resume state: %w", err)
+		}
+
+		if !quiet {
+			printResumeStatus(len(completedSet), len(targets), resumeStatePath)
+		}
+	}
+
+	for index, target := range targets {
+		if resumeEnabled && completedSet[target] {
+			if !quiet {
+				fmt.Printf(" %s %s\n", color.HiBlackString("↷"), color.HiBlackString("Skipping completed target: "+target))
+			}
+			continue
+		}
+
+		targetStart := time.Now()
+		outputFolder := baseFolder
+		if splitPerTarget {
+			baseName := sanitizeTargetName(target)
+			folderName := baseName
+			if usedFolders[baseName] > 0 {
+				folderName = fmt.Sprintf("%s_%d", baseName, usedFolders[baseName]+1)
+			}
+			usedFolders[baseName]++
+			outputFolder = filepath.Join(baseFolder, folderName)
+		}
+
+		if index > 0 {
+			printTargetSeparator()
+		}
+		currentTarget := 0
+		totalTargets := 0
+		if len(targets) > 1 {
+			currentTarget = index + 1
+			totalTargets = len(targets)
+		}
+		discovery(target, outputFolder, toolsArg, verbose, quiet, extractJS, extractUnique, extractSubdomainsEnabled, targets, currentTarget, totalTargets)
+
+		if resumeEnabled {
+			if !completedSet[target] {
+				state.Completed = append(state.Completed, target)
+				completedSet[target] = true
+			}
+			if err := saveResumeState(resumeStatePath, state); err != nil {
+				return fmt.Errorf("error saving resume state: %w", err)
+			}
+		}
+
+		if len(targets) > 1 {
+			printElapsedBox(fmt.Sprintf("TARGET COMPLETED [%d/%d]", currentTarget, totalTargets), time.Since(targetStart))
+		}
+	}
+
+	if len(targets) > 1 {
+		printElapsedBox("TOTAL EXECUTION TIME", time.Since(totalStart))
+	}
+
+	return nil
 }
 
 func init() {
@@ -331,20 +1024,216 @@ func init() {
 
 func main() {
 	domain := flag.String("d", "", "Target domain")
+	domainLong := flag.String("domain", "", "Target domain")
+	listFile := flag.String("l", "", "File with targets, one per line")
+	listFileLong := flag.String("list", "", "File with targets, one per line")
+	extractJSFrom := flag.String("J", "", "Extract JavaScript URLs from an existing URLs file")
+	extractJSFromLong := flag.String("extract-js-from", "", "Extract JavaScript URLs from an existing URLs file")
+	extractUniqueFrom := flag.String("U", "", "Extract normalized URLs from an existing URLs file")
+	extractUniqueFromLong := flag.String("extract-normalized-urls-from", "", "Extract normalized URLs from an existing URLs file")
+	extractSubdomainsFrom := flag.String("S", "", "Extract subdomains from an existing URLs file")
+	extractSubdomainsFromLong := flag.String("extract-subdomains-from", "", "Extract subdomains from an existing URLs file")
+	full := flag.Bool("full", false, "Run the full batch workflow with quiet mode, merged output, and derived files")
 	folderName := flag.String("f", "", "Output folder")
+	folderNameLong := flag.String("output", "", "Output folder")
+	mergeTargets := flag.Bool("merge-targets", false, "Merge all targets from -l into the same output folder")
+	mergeTargetsShort := flag.Bool("m", false, "Merge all targets from -l into the same output folder")
 	toolsArg := flag.String("t", "", "Tools list")
+	toolsArgLong := flag.String("tools", "", "Tools list")
+	extractSubdomains := flag.Bool("extract-subdomains", false, "Extract subdomains into subdomains.txt and newly discovered ones into subdomains_new.txt")
+	extractSubdomainsShort := flag.Bool("s", false, "Extract subdomains into subdomains.txt and newly discovered ones into subdomains_new.txt")
+	extractUnique := flag.Bool("extract-normalized-urls", false, "Extract normalized unique URLs into urls_unique.txt")
+	extractUniqueShort := flag.Bool("u", false, "Extract normalized unique URLs into urls_unique.txt")
+	extractJS := flag.Bool("extract-js", false, "Extract JavaScript URLs into js.txt and js_unique.txt")
+	extractJSShort := flag.Bool("j", false, "Extract JavaScript URLs into js.txt and js_unique.txt")
+	resume := flag.Bool("resume", false, "Resume a target list run from the output folder state file")
+	resumeShort := flag.Bool("r", false, "Resume a target list run from the output folder state file")
+	restart := flag.Bool("restart", false, "Restart a target list run and reset the saved resume state")
+	restartShort := flag.Bool("R", false, "Restart a target list run and reset the saved resume state")
+	quiet := flag.Bool("quiet", false, "Quiet mode")
+	quietShort := flag.Bool("q", false, "Quiet mode")
 	verbose := flag.Bool("v", false, "Verbose mode")
+	verboseLong := flag.Bool("verbose", false, "Verbose mode")
 	flag.Parse()
 
-	if *folderName == "" || *domain == "" {
+	domainValue := *domain
+	if domainValue == "" {
+		domainValue = *domainLong
+	}
+	listFileValue := *listFile
+	if listFileValue == "" {
+		listFileValue = *listFileLong
+	}
+	extractJSFromValue := *extractJSFrom
+	if extractJSFromValue == "" {
+		extractJSFromValue = *extractJSFromLong
+	}
+	extractUniqueFromValue := *extractUniqueFrom
+	if extractUniqueFromValue == "" {
+		extractUniqueFromValue = *extractUniqueFromLong
+	}
+	extractSubdomainsFromValue := *extractSubdomainsFrom
+	if extractSubdomainsFromValue == "" {
+		extractSubdomainsFromValue = *extractSubdomainsFromLong
+	}
+	folderNameValue := *folderName
+	if folderNameValue == "" {
+		folderNameValue = *folderNameLong
+	}
+	toolsArgValue := *toolsArg
+	if toolsArgValue == "" {
+		toolsArgValue = *toolsArgLong
+	}
+	mergeTargetsEnabled := *mergeTargets || *mergeTargetsShort
+	extractSubdomainsEnabled := *extractSubdomains || *extractSubdomainsShort
+	extractUniqueEnabled := *extractUnique || *extractUniqueShort
+	extractJSEnabled := *extractJS || *extractJSShort
+	resumeEnabled := *resume || *resumeShort
+	restartEnabled := *restart || *restartShort
+	quietEnabled := *quiet || *quietShort
+	verboseEnabled := *verbose || *verboseLong
+	fullEnabled := *full
+
+	if resumeEnabled && restartEnabled {
+		color.Red("  ✖ Error: use either -r/--resume or -R/--restart, not both.")
+		os.Exit(1)
+	}
+
+	fromModes := 0
+	if extractJSFromValue != "" {
+		fromModes++
+	}
+	if extractUniqueFromValue != "" {
+		fromModes++
+	}
+	if extractSubdomainsFromValue != "" {
+		fromModes++
+	}
+	if fromModes > 1 {
+		color.Red("  ✖ Error: use only one of -J/--extract-js-from, -U/--extract-normalized-urls-from, or -S/--extract-subdomains-from.")
+		os.Exit(1)
+	}
+	if fullEnabled && fromModes > 0 {
+		color.Red("  ✖ Error: --full cannot be combined with standalone post-processing modes.")
+		os.Exit(1)
+	}
+
+	if extractJSFromValue != "" {
+		if domainValue != "" || listFileValue != "" || folderNameValue != "" || toolsArgValue != "" || mergeTargetsEnabled || extractSubdomainsEnabled || extractUniqueEnabled || extractJSEnabled || resumeEnabled || restartEnabled {
+			color.Red("  ✖ Error: -J/--extract-js-from must be used alone, optionally with -q or -v.")
+			os.Exit(1)
+		}
+		if !quietEnabled {
+			printBanner()
+		}
+		if err := extractJSFromFile(extractJSFromValue, quietEnabled); err != nil {
+			color.Red("  ✖ Error: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if extractUniqueFromValue != "" {
+		if domainValue != "" || listFileValue != "" || folderNameValue != "" || toolsArgValue != "" || mergeTargetsEnabled || extractSubdomainsEnabled || extractUniqueEnabled || extractJSEnabled || resumeEnabled || restartEnabled {
+			color.Red("  ✖ Error: -U/--extract-normalized-urls-from must be used alone, optionally with -q or -v.")
+			os.Exit(1)
+		}
+		if !quietEnabled {
+			printBanner()
+		}
+		if err := extractUniqueFromFile(extractUniqueFromValue, quietEnabled); err != nil {
+			color.Red("  ✖ Error: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if extractSubdomainsFromValue != "" {
+		if folderNameValue != "" || toolsArgValue != "" || mergeTargetsEnabled || extractSubdomainsEnabled || extractUniqueEnabled || extractJSEnabled || resumeEnabled || restartEnabled {
+			color.Red("  ✖ Error: -S/--extract-subdomains-from only supports -d or -l as seed input, optionally with -q or -v.")
+			os.Exit(1)
+		}
+		if (domainValue == "" && listFileValue == "") || (domainValue != "" && listFileValue != "") {
+			color.Red("  ✖ Error: -S/--extract-subdomains-from requires exactly one seed source: -d or -l.")
+			os.Exit(1)
+		}
+		if !quietEnabled {
+			printBanner()
+		}
+
+		var knownTargets []string
+		if listFileValue != "" {
+			targets, err := loadTargetsFromFile(listFileValue)
+			if err != nil {
+				color.Red("  ✖ Error reading target list: %v", err)
+				os.Exit(1)
+			}
+			if len(targets) == 0 {
+				color.Red("  ✖ Error: target list is empty.")
+				os.Exit(1)
+			}
+			knownTargets = targets
+		} else {
+			knownTargets = []string{domainValue}
+		}
+
+		if err := extractSubdomainsFromFile(extractSubdomainsFromValue, knownTargets, quietEnabled); err != nil {
+			color.Red("  ✖ Error: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if fullEnabled {
+		quietEnabled = true
+		extractSubdomainsEnabled = true
+		extractUniqueEnabled = true
+		extractJSEnabled = true
+		if listFileValue != "" {
+			mergeTargetsEnabled = true
+		}
+		if folderNameValue == "" {
+			folderNameValue = "."
+		}
+	}
+
+	if folderNameValue == "" || (domainValue == "" && listFileValue == "") || (domainValue != "" && listFileValue != "") {
 		// Mensagem de erro mais bonita
 		fmt.Println("")
-		color.Red("  ✖ Error: Missing arguments.")
+		color.Red("  ✖ Error: Invalid arguments.")
 		fmt.Println("  Usage: ufinder -d domain.com -f output_folder")
+		fmt.Println("         ufinder -l targets.txt -f output_folder")
+		fmt.Println("         ufinder -l sites.txt --full")
+		fmt.Println("         ufinder -J path/to/urls.txt")
+		fmt.Println("         ufinder -U path/to/urls.txt")
+		fmt.Println("         ufinder -S path/to/urls.txt -d domain.com")
 		fmt.Println("")
 		os.Exit(1)
 	}
 
-	printBanner()
-	discovery(*domain, *folderName, *toolsArg, *verbose)
+	if !quietEnabled {
+		printBanner()
+	}
+
+	if listFileValue != "" {
+		targets, err := loadTargetsFromFile(listFileValue)
+		if err != nil {
+			color.Red("  ✖ Error reading target list: %v", err)
+			os.Exit(1)
+		}
+		if len(targets) == 0 {
+			color.Red("  ✖ Error: target list is empty.")
+			os.Exit(1)
+		}
+		if err := runDiscovery(targets, folderNameValue, toolsArgValue, verboseEnabled, quietEnabled, extractJSEnabled, extractUniqueEnabled, extractSubdomainsEnabled, !mergeTargetsEnabled, resumeEnabled, restartEnabled, normalizePathForState(listFileValue)); err != nil {
+			color.Red("  ✖ Error: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if err := runDiscovery([]string{domainValue}, folderNameValue, toolsArgValue, verboseEnabled, quietEnabled, extractJSEnabled, extractUniqueEnabled, extractSubdomainsEnabled, false, false, false, ""); err != nil {
+		color.Red("  ✖ Error: %v", err)
+		os.Exit(1)
+	}
 }
